@@ -8,24 +8,18 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+
 # ---------- DB připojení ----------
 
 def get_conn():
-    """
-    Vytáhne DATABASE_URL z .env nebo z env proměnných a vrátí psycopg2 connection.
-    """
     load_dotenv()
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("DATABASE_URL není nastaveno (v .env nebo v prostředí).")
+        raise RuntimeError("DATABASE_URL není nastaveno.")
     return psycopg2.connect(db_url)
 
 
 def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
-    """
-    Spustí SQL dotaz a vrátí list dictů (RealDictCursor).
-    V případě chyby jen zaloguje a vyhodí výjimku dál.
-    """
     conn = None
     try:
         conn = get_conn()
@@ -34,33 +28,49 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             rows = cur.fetchall()
         return rows
     except Exception as e:
-        # důležitý log, ať vidíme skutečnou chybu v konzoli
-        print("DB error in /search:", repr(e))
+        print("DB error:", repr(e))
         raise
     finally:
         if conn is not None:
             conn.close()
 
 
-# ---------- FastAPI app ----------
+# ---------- FastAPI ----------
 
 app = FastAPI(title="eSbírka Search API")
 
-# CORS – klidně si přitvrď podle potřeby (např. jen tvůj Bubble domain)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # pro testování necháme všude
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------- MODELY ----------
+
 class SearchResult(BaseModel):
     fragment_id: int
     citace: Optional[str]
     text: str
 
+
+class RagRequest(BaseModel):
+    contract_text: str
+    top_k: int = 5
+
+
+class RagChunk(BaseModel):
+    citation: str
+    text: str
+
+
+class RagResponse(BaseModel):
+    chunks: List[RagChunk]
+
+
+# ---------- ENDPOINTY ----------
 
 @app.get("/health")
 def health():
@@ -69,15 +79,9 @@ def health():
 
 @app.get("/search", response_model=List[SearchResult])
 def search(
-    query: str = Query(..., description="Fulltext dotaz (česky)"),
-    limit: int = Query(5, ge=1, le=50, description="Maximální počet výsledků"),
+    query: str = Query(...),
+    limit: int = Query(5, ge=1, le=50),
 ):
-    """
-    Jednoduchý fulltext nad esb_fragment_meta + esb_fragment_text.
-    - spočítá to_tsvector('simple', ...) in-place
-    - hledá pomocí plainto_tsquery('simple', :query)
-    """
-
     q = query.strip()
     if not q:
         raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
@@ -106,8 +110,30 @@ def search(
     try:
         rows = run_query(sql, (q, limit))
     except Exception:
-        # už jsme zalogovali v run_query, tady jen pošleme generickou chybu ven
         raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
 
-    # Pydantic si to přemapuje podle klíčů
     return rows
+
+
+# ---------- RAG ENDPOINT (pro Make) ----------
+
+@app.post("/rag-search", response_model=RagResponse)
+async def rag_search(req: RagRequest):
+    """
+    RAG endpoint volaný z Make.com:
+    - Make posílá JSON: { "contract_text": "...", "top_k": 5 }
+    - ZATÍM vrací demo výsledek (aby pipeline fungovala)
+    - později sem doplníme reálné RAG vyhledávání
+    """
+
+    text = (req.contract_text or "").strip()
+    if not text:
+        return RagResponse(chunks=[])
+
+    # DEMO verze – vrací první 400 znaků smlouvy
+    demo_chunk = RagChunk(
+        citation="DEMO",
+        text=text[:400]
+    )
+
+    return RagResponse(chunks=[demo_chunk])
