@@ -8,16 +8,27 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from openai import OpenAI
+
+# ---------- ENV ----------
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL není nastaveno.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY není nastaveno.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ---------- DB připojení ----------
 
 def get_conn():
-    load_dotenv()
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL není nastaveno.")
-    return psycopg2.connect(db_url)
+    return psycopg2.connect(DATABASE_URL)
 
 
 def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
@@ -41,11 +52,12 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
 app = FastAPI(title="eSbírka Search API")
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware(
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 )
 
 
@@ -66,7 +78,7 @@ class RagResponse(BaseModel):
     chunks: List[RagChunk]
 
 
-# ---------- ENDPOINTY ----------
+# ---------- ZÁKLADNÍ ENDPOINTY ----------
 
 @app.get("/health")
 def health():
@@ -75,7 +87,6 @@ def health():
 
 @app.get("/healthz")
 def healthz():
-    # pro Render health check
     return {"status": "ok"}
 
 
@@ -117,39 +128,45 @@ def search(
     return rows
 
 
-# ---------- RAG ENDPOINT PRO MAKE (vrací reálné paragrafy) ----------
+# ---------- EMBEDDING POMOCNÉ FUNKCE ----------
 
-def _build_query_from_contract(text: str, max_words: int = 20) -> str:
-    """
-    Vytáhne z textu smlouvy prvních ~max_words „normálních“ slov
-    a z nich udělá jednoduchý fulltext dotaz.
-    """
-    # povolíme česká písmena a čísla
-    words = re.findall(r"[0-9A-Za-zÁ-Žá-ž]+", text)
-    if not words:
-        return ""
-    # vezmeme jen prvních N slov, ať tsquery není mega dlouhý
-    return " ".join(words[:max_words])
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
 
+
+def embed_query(text: str) -> List[float]:
+    clipped = text[:4000] if text else ""
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=clipped,
+    )
+    return resp.data[0].embedding
+
+
+# ---------- RAG ENDPOINT (embedding RAG) ----------
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
-    RAG endpoint volaný z Make.com:
-    - Make pošle syrový text smlouvy v body (text/plain).
-    - My z něj uděláme jednoduchý fulltext dotaz a vrátíme
-      několik relevantních fragmentů zákonů.
+    RAG endpoint pro Make:
+    - Make pošle syrový text smlouvy v body (text/plain)
+    - Vytvoříme embedding dotazu
+    - V DB najdeme nejbližší fragmenty podle pgvector
     """
 
     raw = await request.body()
-    contract_text = raw.decode("utf-8").strip()
+    contract_text = normalize_whitespace(raw.decode("utf-8"))
 
     if not contract_text:
         return RagResponse(chunks=[])
 
-    q = _build_query_from_contract(contract_text)
-    if not q:
-        return RagResponse(chunks=[])
+    try:
+        vec = embed_query(contract_text)
+    except Exception as e:
+        print("Embedding error:", repr(e))
+        raise HTTPException(status_code=500, detail="Chyba při volání embedding modelu.")
+
+    vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
     sql = """
         SELECT
@@ -159,36 +176,25 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         FROM esb_fragment_meta m
         JOIN esb_fragment_text t
           ON t.fragment_id = m.fragment_id
-        WHERE to_tsvector(
-                  'simple',
-                  regexp_replace(
-                      COALESCE(t.fragment_text, ''),
-                      '<[^>]+>', ' ',
-                      'g'
-                  )
-              )
-              @@ plainto_tsquery('simple', %s)
-        ORDER BY m.fragment_id
+        JOIN esb_fragment_embedding e
+          ON e.fragment_id = m.fragment_id
+        ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
 
     try:
-        rows = run_query(sql, (q, top_k))
-    except Exception:
+        rows = run_query(sql, (vec_str, top_k))
+    except Exception as e:
+        print("RAG DB error:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při RAG dotazu do databáze.")
 
     chunks: List[RagChunk] = []
     for r in rows:
-        citation = r.get("citace") or ""
-        text = r.get("text") or ""
+        citation = r.get("citace") or "bez citace"
+        text = normalize_whitespace(r.get("text") or "")
         if not text:
             continue
-        chunks.append(
-            RagChunk(
-                citation=citation or "bez citace",
-                text=text,
-            )
-        )
+        chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
 
