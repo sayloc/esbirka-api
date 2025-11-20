@@ -1,4 +1,5 @@
 import os
+import re
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -72,6 +73,12 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/healthz")
+def healthz():
+    # pro Render health check
+    return {"status": "ok"}
+
+
 @app.get("/search", response_model=List[SearchResult])
 def search(
     query: str = Query(...),
@@ -110,24 +117,78 @@ def search(
     return rows
 
 
-# ---------- RAG ENDPOINT PRO MAKE (bere čistý text) ----------
+# ---------- RAG ENDPOINT PRO MAKE (vrací reálné paragrafy) ----------
+
+def _build_query_from_contract(text: str, max_words: int = 20) -> str:
+    """
+    Vytáhne z textu smlouvy prvních ~max_words „normálních“ slov
+    a z nich udělá jednoduchý fulltext dotaz.
+    """
+    # povolíme česká písmena a čísla
+    words = re.findall(r"[0-9A-Za-zÁ-Žá-ž]+", text)
+    if not words:
+        return ""
+    # vezmeme jen prvních N slov, ať tsquery není mega dlouhý
+    return " ".join(words[:max_words])
+
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
-    Make pošle syrový text smlouvy v body (text/plain).
-    My vrátíme demo chunk, aby pipeline fungovala.
+    RAG endpoint volaný z Make.com:
+    - Make pošle syrový text smlouvy v body (text/plain).
+    - My z něj uděláme jednoduchý fulltext dotaz a vrátíme
+      několik relevantních fragmentů zákonů.
     """
 
     raw = await request.body()
-    text = raw.decode("utf-8").strip()
+    contract_text = raw.decode("utf-8").strip()
 
-    if not text:
+    if not contract_text:
         return RagResponse(chunks=[])
 
-    demo_chunk = RagChunk(
-        citation="DEMO",
-        text=text[:400]  # prvních 400 znaků smlouvy
-    )
+    q = _build_query_from_contract(contract_text)
+    if not q:
+        return RagResponse(chunks=[])
 
-    return RagResponse(chunks=[demo_chunk])
+    sql = """
+        SELECT
+            m.fragment_id,
+            m.citace_text AS citace,
+            t.fragment_text AS text
+        FROM esb_fragment_meta m
+        JOIN esb_fragment_text t
+          ON t.fragment_id = m.fragment_id
+        WHERE to_tsvector(
+                  'simple',
+                  regexp_replace(
+                      COALESCE(t.fragment_text, ''),
+                      '<[^>]+>', ' ',
+                      'g'
+                  )
+              )
+              @@ plainto_tsquery('simple', %s)
+        ORDER BY m.fragment_id
+        LIMIT %s;
+    """
+
+    try:
+        rows = run_query(sql, (q, top_k))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Chyba při RAG dotazu do databáze.")
+
+    chunks: List[RagChunk] = []
+    for r in rows:
+        citation = r.get("citace") or ""
+        text = r.get("text") or ""
+        if not text:
+            continue
+        chunks.append(
+            RagChunk(
+                citation=citation or "bez citace",
+                text=text,
+            )
+        )
+
+    return RagResponse(chunks=chunks)
+
