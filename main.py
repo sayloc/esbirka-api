@@ -1,7 +1,7 @@
 import os
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -54,11 +54,6 @@ class SearchResult(BaseModel):
     fragment_id: int
     citace: Optional[str]
     text: str
-
-
-class RagRequest(BaseModel):
-    contract_text: str
-    top_k: int = 5
 
 
 class RagChunk(BaseModel):
@@ -115,25 +110,24 @@ def search(
     return rows
 
 
-# ---------- RAG ENDPOINT (pro Make) ----------
+# ---------- RAG ENDPOINT PRO MAKE (bere čistý text) ----------
 
 @app.post("/rag-search", response_model=RagResponse)
-async def rag_search(req: RagRequest):
+async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
-    RAG endpoint volaný z Make.com:
-    - Make posílá JSON: { "contract_text": "...", "top_k": 5 }
-    - ZATÍM vrací demo výsledek (aby pipeline fungovala)
-    - později sem doplníme reálné RAG vyhledávání
+    Make pošle syrový text smlouvy v body (text/plain).
+    My vrátíme demo chunk, aby pipeline fungovala.
     """
 
-    text = (req.contract_text or "").strip()
+    raw = await request.body()
+    text = raw.decode("utf-8").strip()
+
     if not text:
         return RagResponse(chunks=[])
 
-    # DEMO verze – vrací první 400 znaků smlouvy
     demo_chunk = RagChunk(
         citation="DEMO",
-        text=text[:400]
+        text=text[:400]  # prvních 400 znaků smlouvy
     )
 
     return RagResponse(chunks=[demo_chunk])
