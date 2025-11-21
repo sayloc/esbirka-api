@@ -197,3 +197,4 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
+
