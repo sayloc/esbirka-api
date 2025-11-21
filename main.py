@@ -25,7 +25,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ---------- DB připojení ----------
+# ---------- DB ----------
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -47,14 +47,13 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             conn.close()
 
 
-# ---------- FastAPI ----------
+# ---------- FastAPI app ----------
 
 app = FastAPI(title="eSbírka Search API")
 
-# CORS – správný tvar
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # můžeš zúžit na svůj frontend
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,6 +77,26 @@ class RagResponse(BaseModel):
     chunks: List[RagChunk]
 
 
+# ---------- UTIL ----------
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def strip_html(text: str) -> str:
+    # vyhodí všechny HTML tagy (table, td, p, span…)
+    return re.sub(r"<[^>]+>", " ", text or "")
+
+
+def embed_query(text: str) -> List[float]:
+    clipped = text[:4000] if text else ""
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=clipped,
+    )
+    return resp.data[0].embedding
+
+
 # ---------- ZÁKLADNÍ ENDPOINTY ----------
 
 @app.get("/health")
@@ -95,6 +114,10 @@ def search(
     query: str = Query(...),
     limit: int = Query(5, ge=1, le=50),
 ):
+    """
+    Jednoduchý fulltext přes to_tsvector/plainto_tsquery.
+    Používá se hlavně na testování.
+    """
     q = query.strip()
     if not q:
         raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
@@ -128,30 +151,19 @@ def search(
     return rows
 
 
-# ---------- EMBEDDING POMOCNÉ FUNKCE ----------
-
-def normalize_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def embed_query(text: str) -> List[float]:
-    clipped = text[:4000] if text else ""
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=clipped,
-    )
-    return resp.data[0].embedding
-
-
-# ---------- RAG ENDPOINT (embedding RAG) ----------
+# ---------- RAG ENDPOINT (embedding + pgvector) ----------
 
 @app.post("/rag-search", response_model=RagResponse)
-async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
+async def rag_search(
+    request: Request,
+    top_k: int = Query(5, ge=1, le=20),
+):
     """
     RAG endpoint pro Make:
     - Make pošle syrový text smlouvy v body (text/plain)
-    - Vytvoříme embedding dotazu
-    - V DB najdeme nejbližší fragmenty podle pgvector
+    - spočítáme embedding dotazu (OpenAI)
+    - v DB najdeme nejbližší fragmenty (pgvector)
+    - vrátíme čistý text BEZ HTML tagů
     """
 
     raw = await request.body()
@@ -160,14 +172,17 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     if not contract_text:
         return RagResponse(chunks=[])
 
+    # 1) embedding dotazu
     try:
         vec = embed_query(contract_text)
     except Exception as e:
         print("Embedding error:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při volání embedding modelu.")
 
+    # převedeme na string ve formátu pgvector
     vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
+    # 2) vektorové hledání v DB
     sql = """
         SELECT
             m.fragment_id,
@@ -188,13 +203,20 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         print("RAG DB error:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při RAG dotazu do databáze.")
 
+    # 3) očista textu a sestavení odpovědi
     chunks: List[RagChunk] = []
     for r in rows:
         citation = r.get("citace") or "bez citace"
-        text = normalize_whitespace(r.get("text") or "")
-        if not text:
+        raw_text = r.get("text") or ""
+        clean_text = normalize_whitespace(strip_html(raw_text))
+        if not clean_text:
             continue
-        chunks.append(RagChunk(citation=citation, text=text))
+
+        chunks.append(
+            RagChunk(
+                citation=citation,
+                text=clean_text,
+            )
+        )
 
     return RagResponse(chunks=chunks)
-
