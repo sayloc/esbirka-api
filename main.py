@@ -51,13 +51,13 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
 
 app = FastAPI(title="eSbírka Search API")
 
+# CORS – správný tvar
 app.add_middleware(
-    CORSMiddleware(
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=["*"],       # můžeš zúžit na svůj frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -197,4 +197,3 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
-
