@@ -1,5 +1,6 @@
 import os
 import re
+import html
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -25,7 +26,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ---------- DB ----------
+# ---------- DB připojení ----------
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -47,7 +48,35 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             conn.close()
 
 
-# ---------- FastAPI app ----------
+# ---------- TEXT UTILITY ----------
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def strip_html(raw: str) -> str:
+    """
+    Odstraní HTML tagy a unescape HTML entity.
+    """
+    if not raw:
+        return ""
+    # pryč tagy
+    no_tags = re.sub(r"<[^>]+>", " ", raw)
+    # HTML entity → normální znaky (&nbsp; → mezera atd.)
+    unescaped = html.unescape(no_tags)
+    return normalize_whitespace(unescaped)
+
+
+def clean_text_for_embedding(text: str) -> str:
+    """
+    Text do embeddingu – bez HTML, bez extra whitespace, omezený na rozumnou délku.
+    """
+    cleaned = strip_html(text)
+    # safety limit, ať neposíláme mega text
+    return cleaned[:8000]
+
+
+# ---------- FastAPI ----------
 
 app = FastAPI(title="eSbírka Search API")
 
@@ -77,26 +106,6 @@ class RagResponse(BaseModel):
     chunks: List[RagChunk]
 
 
-# ---------- UTIL ----------
-
-def normalize_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def strip_html(text: str) -> str:
-    # vyhodí všechny HTML tagy (table, td, p, span…)
-    return re.sub(r"<[^>]+>", " ", text or "")
-
-
-def embed_query(text: str) -> List[float]:
-    clipped = text[:4000] if text else ""
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=clipped,
-    )
-    return resp.data[0].embedding
-
-
 # ---------- ZÁKLADNÍ ENDPOINTY ----------
 
 @app.get("/health")
@@ -116,7 +125,7 @@ def search(
 ):
     """
     Jednoduchý fulltext přes to_tsvector/plainto_tsquery.
-    Používá se hlavně na testování.
+    Pro debug / interní použití.
     """
     q = query.strip()
     if not q:
@@ -148,41 +157,66 @@ def search(
     except Exception:
         raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
 
-    return rows
+    # očistíme HTML i tady, ať máš čistý text
+    out: List[SearchResult] = []
+    for r in rows:
+        out.append(
+            SearchResult(
+                fragment_id=r["fragment_id"],
+                citace=r.get("citace"),
+                text=strip_html(r.get("text") or ""),
+            )
+        )
+    return out
 
 
-# ---------- RAG ENDPOINT (embedding + pgvector) ----------
+# ---------- EMBEDDING POMOCNÉ FUNKCE ----------
+
+def embed_query(text: str) -> List[float]:
+    """
+    Udělá embedding dotazu přes text-embedding-3-small.
+    """
+    clipped = clean_text_for_embedding(text)
+    if not clipped:
+        clipped = "prázdný dotaz"
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=clipped,
+    )
+    return resp.data[0].embedding
+
+
+# ---------- RAG ENDPOINT (embedding RAG) ----------
 
 @app.post("/rag-search", response_model=RagResponse)
-async def rag_search(
-    request: Request,
-    top_k: int = Query(5, ge=1, le=20),
-):
+async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
     RAG endpoint pro Make:
-    - Make pošle syrový text smlouvy v body (text/plain)
-    - spočítáme embedding dotazu (OpenAI)
-    - v DB najdeme nejbližší fragmenty (pgvector)
-    - vrátíme čistý text BEZ HTML tagů
+    - Make pošle syrový text smlouvy / právního dokumentu v body (text/plain)
+    - Vytvoříme embedding dotazu
+    - Najdeme nejbližší paragrafy v DB (pgvector)
+
+    POZOR:
+    - Teď bereme jen fragmenty, které mají citaci paragrafu (m.citace_text LIKE '§ %').
+    - Až budeš chtít přidat judikáty / vyhlášky / přílohy,
+      upraví se tady WHERE podmínka (whitelist / další OR).
     """
 
     raw = await request.body()
-    contract_text = normalize_whitespace(raw.decode("utf-8"))
+    contract_text = clean_text_for_embedding(raw.decode("utf-8"))
 
     if not contract_text:
         return RagResponse(chunks=[])
 
-    # 1) embedding dotazu
     try:
         vec = embed_query(contract_text)
     except Exception as e:
         print("Embedding error:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při volání embedding modelu.")
 
-    # převedeme na string ve formátu pgvector
+    # pgvector očekává textové pole v podobě [x,y,z,...]
     vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
-    # 2) vektorové hledání v DB
     sql = """
         SELECT
             m.fragment_id,
@@ -193,6 +227,11 @@ async def rag_search(
           ON t.fragment_id = m.fragment_id
         JOIN esb_fragment_embedding e
           ON e.fragment_id = m.fragment_id
+        -- 🔴 DŮLEŽITÉ:
+        -- Teď RAG bere jen paragrafy (citace začíná "§ ").
+        -- AŽ BUDEŠ CHTÍT judikáty / vyhlášky / přílohy,
+        -- upraví se TADY filtr (např. OR m.law_type IN (...)).
+        WHERE m.citace_text LIKE '§ %'
         ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
@@ -203,20 +242,12 @@ async def rag_search(
         print("RAG DB error:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při RAG dotazu do databáze.")
 
-    # 3) očista textu a sestavení odpovědi
     chunks: List[RagChunk] = []
     for r in rows:
         citation = r.get("citace") or "bez citace"
-        raw_text = r.get("text") or ""
-        clean_text = normalize_whitespace(strip_html(raw_text))
-        if not clean_text:
+        text = strip_html(r.get("text") or "")
+        if not text:
             continue
-
-        chunks.append(
-            RagChunk(
-                citation=citation,
-                text=clean_text,
-            )
-        )
+        chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
