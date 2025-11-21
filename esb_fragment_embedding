@@ -1,0 +1,86 @@
+import os
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from openai import OpenAI
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL není nastaveno")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY není nastaveno")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def fetch_batch(limit=100):
+    sql = """
+        SELECT t.fragment_id, t.fragment_text
+        FROM esb_fragment_text t
+        LEFT JOIN esb_fragment_embedding e
+          ON e.fragment_id = t.fragment_id
+        WHERE e.fragment_id IS NULL
+        ORDER BY t.fragment_id
+        LIMIT %s;
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+        return rows
+    finally:
+        conn.close()
+
+
+def save_embedding(fragment_id: int, embedding):
+    vec_str = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+    sql = """
+        INSERT INTO esb_fragment_embedding (fragment_id, embedding)
+        VALUES (%s, %s::vector)
+        ON CONFLICT (fragment_id) DO UPDATE
+          SET embedding = EXCLUDED.embedding;
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (fragment_id, vec_str))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def embed_text(text: str):
+    text = (text or "")[:4000]
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return resp.data[0].embedding
+
+
+def main():
+    while True:
+        batch = fetch_batch(limit=50)
+        if not batch:
+            print("✅ Hotovo – žádné další fragmenty.")
+            break
+
+        print(f"Zpracovávám batch ({len(batch)} řádků)…")
+        for row in batch:
+            fid = row["fragment_id"]
+            txt = row["fragment_text"] or ""
+            emb = embed_text(txt)
+            save_embedding(fid, emb)
+            print(f"  OK fragment_id={fid}")
+
+if __name__ == "__main__":
+    main()
