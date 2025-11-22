@@ -86,26 +86,31 @@ def normalize_whitespace(text: str) -> str:
 
 def clean_text_for_embedding(text: str) -> str:
     """
-    Vyčistí text před poslání do embeddingu:
+    Vyčistí text před posláním do embeddingu:
     - odstraní HTML tagy
     - znormalizuje whitespace
     - ořeže na rozumnou délku
     """
     if not text:
         return ""
-    # pryč tagy typu <var>...</var>, <sup>...</sup> atd.
+    text = html.unescape(text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = normalize_whitespace(text)
-    # 4000 znaků stačí
     return text[:4000]
 
 
 def safe_out(text: str) -> str:
     """
-    Výstup pro klienta: dekóduje HTML entity (&aacute; -> á)
-    a ořízne mezery.
+    Výstup pro klienta:
+    - dekóduje HTML entity (&aacute; -> á)
+    - odstraní HTML tagy
+    - znormalizuje mezery
     """
-    return html.unescape(text or "").strip()
+    if not text:
+        return ""
+    s = html.unescape(text)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return normalize_whitespace(s)
 
 
 def embed_query(text: str) -> List[float]:
@@ -164,14 +169,13 @@ def search(
     except Exception:
         raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
 
-    # lehké vyčištění výstupu
     results: List[SearchResult] = []
     for r in rows:
         results.append(
             SearchResult(
                 fragment_id=r["fragment_id"],
                 citace=safe_out(r.get("citace")),
-                text=normalize_whitespace(safe_out(r.get("text"))),
+                text=safe_out(r.get("text")),
             )
         )
     return results
@@ -243,10 +247,9 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     chunks: List[RagChunk] = []
     for r in rows:
         citation = safe_out(r.get("citace") or "bez citace")
-        text = normalize_whitespace(safe_out(r.get("text") or ""))
+        text = safe_out(r.get("text") or "")
         if not text:
             continue
         chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
-
