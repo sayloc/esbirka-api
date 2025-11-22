@@ -12,17 +12,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 
-# ---------------------------------------------------------
-# UTF-8 JSON OUTPUT
-# ---------------------------------------------------------
-
-class UTF8JSONResponse(JSONResponse):
-    media_type = "application/json; charset=utf-8"
-
-
-# ---------------------------------------------------------
-# ENV
-# ---------------------------------------------------------
+# ---------- ENV ----------
 
 load_dotenv()
 
@@ -37,9 +27,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ---------------------------------------------------------
-# DB
-# ---------------------------------------------------------
+# ---------- DB připojení ----------
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -51,18 +39,21 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
         conn = get_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return cur.fetchall()
+            rows = cur.fetchall()
+        return rows
     except Exception as e:
         print("DB error:", repr(e))
         raise
     finally:
-        if conn:
+        if conn is not None:
             conn.close()
 
 
-# ---------------------------------------------------------
-# FASTAPI
-# ---------------------------------------------------------
+# ---------- FastAPI + UTF-8 JSON ----------
+
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
 
 app = FastAPI(
     title="eSbírka Search API",
@@ -78,9 +69,7 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------
-# MODELS
-# ---------------------------------------------------------
+# ---------- MODELY ----------
 
 class SearchResult(BaseModel):
     fragment_id: int
@@ -98,28 +87,41 @@ class RagResponse(BaseModel):
     chunks: List[RagChunk]
 
 
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
+# ---------- POMOCNÉ FUNKCE ----------
 
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def strip_html_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", " ", text or "")
-
-
-def clean_text_for_embedding(text: str) -> str:
+def strip_html(text: str) -> str:
     if not text:
         return ""
-    text = strip_html_tags(text)
-    text = normalize_whitespace(text)
-    return text[:4000]
+    # pryč HTML tagy
+    text = re.sub(r"<[^>]+>", " ", text)
+    return normalize_whitespace(text)
 
 
 def safe_out(text: str) -> str:
+    """
+    Výstup pro klienta: dekóduje HTML entity (&aacute; -> á)
+    a ořízne mezery.
+    """
     return html.unescape(text or "").strip()
+
+
+def clean_text_for_embedding(text: str) -> str:
+    """
+    Čištění textu před embeddingem (dotaz i fragmenty):
+    - odstraní HTML tagy
+    - dekóduje HTML entity
+    - znormalizuje whitespace
+    - zkrátí na 4000 znaků
+    """
+    if not text:
+        return ""
+    text = strip_html(text)
+    text = safe_out(text)
+    return text[:4000]
 
 
 def embed_query(text: str) -> List[float]:
@@ -131,12 +133,15 @@ def embed_query(text: str) -> List[float]:
     return resp.data[0].embedding
 
 
-# ---------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------
+# ---------- ZÁKLADNÍ ENDPOINTY ----------
 
 @app.get("/health")
 def health():
+    return {"status": "ok"}
+
+
+@app.get("/healthz")
+def healthz():
     return {"status": "ok"}
 
 
@@ -150,27 +155,25 @@ def debug_fragment(fragment_id: int):
     sql = """
         SELECT fragment_id, fragment_text
         FROM esb_fragment_text
-        WHERE fragment_id = %s
+        WHERE fragment_id = %s;
     """
     rows = run_query(sql, (fragment_id,))
     if not rows:
-        raise HTTPException(404, "Fragment nenalezen.")
+        raise HTTPException(status_code=404, detail="Fragment nenalezen.")
 
-    raw = rows[0]["fragment_text"]
-    stripped = clean_text_for_embedding(raw)
+    raw = rows[0]["fragment_text"] or ""
+    stripped = strip_html(raw)
     safe = safe_out(stripped)
 
     return {
         "fragment_id": fragment_id,
         "raw": raw,
         "stripped": stripped,
-        "safe": safe
+        "safe": safe,
     }
 
 
-# ---------------------------------------------------------
-# /search – čistý fulltext
-# ---------------------------------------------------------
+# ---------- FULLTEXT /search (zatím jednoduchý) ----------
 
 @app.get("/search", response_model=List[SearchResult])
 def search(
@@ -181,6 +184,7 @@ def search(
     if not q:
         raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
 
+    # jednoduchý fulltext přes czech konfiguraci
     sql = """
         SELECT
             m.fragment_id,
@@ -190,14 +194,14 @@ def search(
         JOIN esb_fragment_text t
           ON t.fragment_id = m.fragment_id
         WHERE to_tsvector(
-                  'simple',
+                  'czech',
                   regexp_replace(
                       COALESCE(t.fragment_text, ''),
                       '<[^>]+>', ' ',
                       'g'
                   )
               )
-              @@ plainto_tsquery('simple', %s)
+              @@ plainto_tsquery('czech', %s)
         ORDER BY m.fragment_id
         LIMIT %s;
     """
@@ -213,24 +217,21 @@ def search(
             SearchResult(
                 fragment_id=r["fragment_id"],
                 citace=safe_out(r.get("citace")),
-                text=clean_text_for_embedding(safe_out(r.get("text"))),
+                text=strip_html(r.get("text") or ""),
             )
         )
     return results
 
 
-# ---------------------------------------------------------
-# /rag-search – HYBRID: fulltext + vektor
-# ---------------------------------------------------------
+# ---------- RAG ENDPOINT (čistý vektor + paragrafy) ----------
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
     RAG endpoint pro Make:
-    - Make pošle syrový text smlouvy v body (text/plain)
+    - Make pošle syrový text smlouvy / dotazu v body (text/plain)
     - Vytvoříme embedding dotazu
-    - V DB najdeme nejbližší fragmenty podle pgvector,
-      ALE jen z těch, které fulltextem odpovídají dotazu.
+    - V DB najdeme nejbližší paragrafy pomocí pgvector
     """
 
     raw = await request.body()
@@ -244,68 +245,64 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         except Exception:
             contract_text = raw.decode("utf-8", errors="ignore")
 
-    # text pro embedding
-    cleaned_for_embed = clean_text_for_embedding(contract_text)
-    if not cleaned_for_embed:
+    contract_text = clean_text_for_embedding(contract_text)
+
+    if not contract_text:
         return RagResponse(chunks=[])
 
-    # text pro fulltext (může být stejný)
-    fulltext_query = cleaned_for_embed
-
-    # embedding dotazu
     try:
-        vec = embed_query(cleaned_for_embed)
+        vec = embed_query(contract_text)
     except Exception as e:
         print("Embedding error:", repr(e))
-        raise HTTPException(500, "Chyba embeddingu.")
+        raise HTTPException(
+            status_code=500,
+            detail="Chyba při volání embedding modelu."
+        )
 
     vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
-    # HYBRID: fulltext + vektor
+    # ČISTÝ VEKTOR + FILTR NA PARAGRAFY (§ ...)
     sql = """
         SELECT
             m.fragment_id,
             m.citace_text AS citace,
             t.fragment_text AS text
-        FROM esb_fragment_meta m
+        FROM esb_fragment_embedding e
+        JOIN esb_fragment_meta m
+          ON m.fragment_id = e.fragment_id
         JOIN esb_fragment_text t
-          ON t.fragment_id = m.fragment_id
-        JOIN esb_fragment_embedding e
-          ON e.fragment_id = m.fragment_id
+          ON t.fragment_id = e.fragment_id
         WHERE t.fragment_text IS NOT NULL
           AND length(trim(t.fragment_text)) > 50
-          AND to_tsvector(
-                'simple',
-                regexp_replace(
-                    COALESCE(t.fragment_text, ''),
-                    '<[^>]+>', ' ',
-                    'g'
-                )
-              )
-              @@ plainto_tsquery('simple', %s)
+          AND m.citace_text LIKE '§ %'
         ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
 
     try:
-        rows = run_query(sql, (fulltext_query, vec_str, top_k))
+        rows = run_query(sql, (vec_str, top_k))
     except Exception as e:
         print("RAG DB error:", repr(e))
-        raise HTTPException(500, "Chyba při RAG dotazu.")
+        raise HTTPException(
+            status_code=500,
+            detail="Chyba při RAG dotazu do databáze."
+        )
 
     chunks: List[RagChunk] = []
     for r in rows:
-        citation = safe_out(r.get("citace") or "bez citace")
-        # tady už HTML TAGY STRHÁVÁME
-        text = clean_text_for_embedding(safe_out(r.get("text") or ""))
-
-        if not text:
+        raw_text = r.get("text") or ""
+        cleaned_text = clean_text_for_embedding(raw_text)
+        if not cleaned_text:
             continue
 
-        chunks.append(RagChunk(
-            fragment_id=r["fragment_id"],
-            citation=citation,
-            text=text,
-        ))
+        citation = safe_out(r.get("citace") or "bez citace")
+
+        chunks.append(
+            RagChunk(
+                fragment_id=r["fragment_id"],
+                citation=citation,
+                text=cleaned_text,
+            )
+        )
 
     return RagResponse(chunks=chunks)
