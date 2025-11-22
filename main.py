@@ -48,6 +48,71 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             conn.close()
 
 
+# ---------- POMOCNÉ FUNKCE ----------
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def strip_html(text: str) -> str:
+    """
+    Pryč HTML tagy typu <var>, <sup>, <table> atd.
+    """
+    if not text:
+        return ""
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def clean_text_for_embedding(text: str) -> str:
+    """
+    Text pro embedding:
+    - odstraní HTML tagy
+    - znormalizuje mezery
+    - ořízne délku
+    """
+    if not text:
+        return ""
+    text = strip_html(text)
+    text = normalize_whitespace(text)
+    return text[:4000]
+
+
+def fix_mojibake(text: str) -> str:
+    """
+    Pokus o opravu rozbitého kódování typu 'ÄÃST' -> 'ČÁST'.
+    Dělá se jen když v textu jsou typické znaky 'Ã' / 'Ä'.
+    """
+    if not text:
+        return ""
+    if "Ã" in text or "Ä" in text:
+        try:
+            return text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            return text
+    return text
+
+
+def safe_out(text: str) -> str:
+    """
+    Výstup pro klienta:
+    - dekóduje HTML entity (&aacute; -> á)
+    - pokusí se opravit mojibake
+    - ořízne mezery
+    """
+    t = html.unescape(text or "")
+    t = fix_mojibake(t)
+    return t.strip()
+
+
+def embed_query(text: str) -> List[float]:
+    clipped = text[:4000] if text else ""
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=clipped,
+    )
+    return resp.data[0].embedding
+
+
 # ---------- FastAPI ----------
 
 app = FastAPI(title="eSbírka Search API")
@@ -76,49 +141,6 @@ class RagChunk(BaseModel):
 
 class RagResponse(BaseModel):
     chunks: List[RagChunk]
-
-
-# ---------- POMOCNÉ FUNKCE ----------
-
-def normalize_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def strip_html_and_unescape(text: str) -> str:
-    """
-    Použijeme pro text z DB i pro citace:
-    - sundá HTML tagy (<var>, <sup>, tabulky, atd.)
-    - dekóduje HTML entity (&aacute; -> á)
-    - znormalizuje mezery
-    """
-    if not text:
-        return ""
-    no_tags = re.sub(r"<[^>]+>", " ", text)
-    unescaped = html.unescape(no_tags)
-    return normalize_whitespace(unescaped)
-
-
-def clean_text_for_embedding(text: str) -> str:
-    """
-    Čištění vstupního textu (smlouva od Make):
-    - pryč HTML (kdyby tam bylo)
-    - normalizace mezer
-    - ořez na rozumnou délku
-    """
-    if not text:
-        return ""
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = normalize_whitespace(text)
-    return text[:4000]
-
-
-def embed_query(text: str) -> List[float]:
-    clipped = text[:4000] if text else ""
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=clipped,
-    )
-    return resp.data[0].embedding
 
 
 # ---------- ZÁKLADNÍ ENDPOINTY ----------
@@ -170,15 +192,13 @@ def search(
 
     results: List[SearchResult] = []
     for r in rows:
-        citace_clean = strip_html_and_unescape(r.get("citace") or "")
-        text_clean = strip_html_and_unescape(r.get("text") or "")
-        if not text_clean:
-            continue
         results.append(
             SearchResult(
                 fragment_id=r["fragment_id"],
-                citace=citace_clean or None,
-                text=text_clean,
+                citace=safe_out(r.get("citace")),
+                text=normalize_whitespace(
+                    safe_out(strip_html(r.get("text") or ""))
+                ),
             )
         )
     return results
@@ -189,15 +209,15 @@ def search(
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
-    RAG endpoint pro Make:
-    - Make pošle syrový text smlouvy v body (text/plain)
-    - Vytvoříme embedding dotazu
-    - V DB najdeme nejbližší fragmenty podle pgvector
+    RAG endpoint:
+    - klient pošle syrový text smlouvy v body (text/plain)
+    - vytvoříme embedding dotazu
+    - v DB najdeme nejbližší fragmenty podle pgvector
     """
 
     raw = await request.body()
 
-    # robustní dekódování vstupu (aby nespadlo na UnicodeDecodeError)
+    # robustní dekódování
     try:
         contract_text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -249,15 +269,12 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
 
     chunks: List[RagChunk] = []
     for r in rows:
-        citation = strip_html_and_unescape(r.get("citace") or "")
-        text = strip_html_and_unescape(r.get("text") or "")
+        citation = safe_out(r.get("citace") or "bez citace")
+        text = normalize_whitespace(
+            safe_out(strip_html(r.get("text") or ""))
+        )
         if not text:
             continue
-        chunks.append(
-            RagChunk(
-                citation=citation or "bez citace",
-                text=text,
-            )
-        )
+        chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
