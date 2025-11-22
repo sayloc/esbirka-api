@@ -48,55 +48,10 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             conn.close()
 
 
-# ---------- TEXT POMOCNÉ FUNKCE ----------
-
-html_tag_re = re.compile(r"<[^>]+>")
-
-
-def normalize_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def strip_html(text: str) -> str:
-    if not text:
-        return ""
-    # odstraní HTML tagy
-    no_tags = html_tag_re.sub(" ", text)
-    # dekóduje HTML entity (&nbsp;, &aacute;)
-    unescaped = html.unescape(no_tags)
-    return normalize_whitespace(unescaped)
-
-
-def clean_text_for_embedding(text: str) -> str:
-    """
-    Čištění vstupního textu (smlouva, dotaz).
-    """
-    if not text:
-        return ""
-    return normalize_whitespace(strip_html(text))
-
-
-def safe_out(text: str) -> str:
-    """
-    Čištění textu před odesláním ven v JSON (citace i fragment).
-    """
-    return strip_html(text or "")
-
-
-def embed_query(text: str) -> List[float]:
-    clipped = text[:4000] if text else ""
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=clipped,
-    )
-    return resp.data[0].embedding
-
-
 # ---------- FastAPI ----------
 
 app = FastAPI(title="eSbírka Search API")
 
-# POZOR: CORSMiddleware se přidává přes add_middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -121,6 +76,45 @@ class RagChunk(BaseModel):
 
 class RagResponse(BaseModel):
     chunks: List[RagChunk]
+
+
+# ---------- POMOCNÉ FUNKCE ----------
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_text_for_embedding(text: str) -> str:
+    """
+    Vyčistí text před poslání do embeddingu:
+    - odstraní HTML tagy
+    - znormalizuje whitespace
+    - ořeže na rozumnou délku
+    """
+    if not text:
+        return ""
+    # pryč tagy typu <var>...</var>, <sup>...</sup> atd.
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = normalize_whitespace(text)
+    # 4000 znaků stačí
+    return text[:4000]
+
+
+def safe_out(text: str) -> str:
+    """
+    Výstup pro klienta: dekóduje HTML entity (&aacute; -> á)
+    a ořízne mezery.
+    """
+    return html.unescape(text or "").strip()
+
+
+def embed_query(text: str) -> List[float]:
+    clipped = text[:4000] if text else ""
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=clipped,
+    )
+    return resp.data[0].embedding
 
 
 # ---------- ZÁKLADNÍ ENDPOINTY ----------
@@ -170,33 +164,20 @@ def search(
     except Exception:
         raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
 
-    # očistíme texty pro výstup
-    out: List[SearchResult] = []
+    # lehké vyčištění výstupu
+    results: List[SearchResult] = []
     for r in rows:
-        out.append(
+        results.append(
             SearchResult(
                 fragment_id=r["fragment_id"],
                 citace=safe_out(r.get("citace")),
-                text=safe_out(r.get("text")),
+                text=normalize_whitespace(safe_out(r.get("text"))),
             )
         )
-    return out
+    return results
 
 
 # ---------- RAG ENDPOINT (embedding RAG) ----------
-
-def decode_body_safe(raw: bytes) -> str:
-    """
-    Zkusí UTF-8, pak cp1250, pak latin-1.
-    Když nic, tak prostě ignoruje chybné bajty.
-    """
-    for enc in ("utf-8", "cp1250", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="ignore")
-
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
@@ -208,21 +189,29 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
 
     raw = await request.body()
-    if not raw:
-        return RagResponse(chunks=[])
 
-    body_text = decode_body_safe(raw)
-    contract_text = clean_text_for_embedding(body_text)
+    # robustní dekódování (bez 500 při špatném kódování)
+    try:
+        contract_text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            contract_text = raw.decode("latin-1")
+        except Exception:
+            contract_text = raw.decode("utf-8", errors="ignore")
+
+    contract_text = clean_text_for_embedding(contract_text)
 
     if not contract_text:
         return RagResponse(chunks=[])
 
-    # embedding dotazu
     try:
         vec = embed_query(contract_text)
     except Exception as e:
         print("Embedding error:", repr(e))
-        raise HTTPException(status_code=500, detail="Chyba při volání embedding modelu.")
+        raise HTTPException(
+            status_code=500,
+            detail="Chyba při volání embedding modelu."
+        )
 
     vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
@@ -237,7 +226,7 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         JOIN esb_fragment_embedding e
           ON e.fragment_id = m.fragment_id
         WHERE t.fragment_text IS NOT NULL
-          AND length(trim(t.fragment_text)) > 0
+          AND length(trim(t.fragment_text)) > 20
         ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
@@ -246,14 +235,18 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         rows = run_query(sql, (vec_str, top_k))
     except Exception as e:
         print("RAG DB error:", repr(e))
-        raise HTTPException(status_code=500, detail="Chyba při RAG dotazu do databáze.")
+        raise HTTPException(
+            status_code=500,
+            detail="Chyba při RAG dotazu do databáze."
+        )
 
     chunks: List[RagChunk] = []
     for r in rows:
         citation = safe_out(r.get("citace") or "bez citace")
-        text = safe_out(r.get("text") or "")
+        text = normalize_whitespace(safe_out(r.get("text") or ""))
         if not text:
             continue
         chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
+
