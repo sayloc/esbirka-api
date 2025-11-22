@@ -42,15 +42,21 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
     try:
         conn = get_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # DEBUG – klidně si pak zakomentuj
+            # DEBUG
             # print("SQL:", sql)
             # print("PARAMS:", params)
 
-            cur.execute(sql, params or ())
+            if params is not None:
+                cur.execute(sql, params)
+            else:
+                cur.execute(sql)
+
             rows = cur.fetchall()
         return rows
     except Exception as e:
         print("DB error:", repr(e))
+        print("SQL used:", sql)
+        print("PARAMS used:", params)
         raise
     finally:
         if conn is not None:
@@ -266,10 +272,11 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
             detail=f"Embedding error: {repr(e)}",
         )
 
-    vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+    # složíme pgvector literál: '[0.123,0.456,...]'
+    vec_literal = "[" + ",".join(str(x) for x in vec) + "]"
 
     # --- RAG DOTAZ DO DB ---
-    sql = """
+    sql = f"""
         SELECT
             e.fragment_id,
             m.citace_text AS citace,
@@ -282,12 +289,12 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         WHERE t.fragment_text IS NOT NULL
           AND length(trim(t.fragment_text)) > 50
           AND m.citace_text LIKE '§ %'
-        ORDER BY e.embedding <-> %s::vector
-        LIMIT %s;
+        ORDER BY e.embedding <-> '{vec_literal}'::vector
+        LIMIT {top_k};
     """
 
     try:
-        rows = run_query(sql, (vec_str, top_k))
+        rows = run_query(sql)
     except Exception as e:
         print("RAG DB error:", repr(e))
         raise HTTPException(
@@ -313,4 +320,3 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         )
 
     return RagResponse(chunks=chunks)
-
