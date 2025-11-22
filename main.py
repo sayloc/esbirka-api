@@ -55,21 +55,12 @@ def normalize_whitespace(text: str) -> str:
 
 
 def strip_html(text: str) -> str:
-    """
-    Pryč HTML tagy typu <var>, <sup>, <table> atd.
-    """
     if not text:
         return ""
     return re.sub(r"<[^>]+>", " ", text)
 
 
 def clean_text_for_embedding(text: str) -> str:
-    """
-    Text pro embedding:
-    - odstraní HTML tagy
-    - znormalizuje mezery
-    - ořízne délku
-    """
     if not text:
         return ""
     text = strip_html(text)
@@ -78,10 +69,6 @@ def clean_text_for_embedding(text: str) -> str:
 
 
 def fix_mojibake(text: str) -> str:
-    """
-    Pokus o opravu rozbitého kódování typu 'ÄÃST' -> 'ČÁST'.
-    Dělá se jen když v textu jsou typické znaky 'Ã' / 'Ä'.
-    """
     if not text:
         return ""
     if "Ã" in text or "Ä" in text:
@@ -93,12 +80,6 @@ def fix_mojibake(text: str) -> str:
 
 
 def safe_out(text: str) -> str:
-    """
-    Výstup pro klienta:
-    - dekóduje HTML entity (&aacute; -> á)
-    - pokusí se opravit mojibake
-    - ořízne mezery
-    """
     t = html.unescape(text or "")
     t = fix_mojibake(t)
     return t.strip()
@@ -143,7 +124,7 @@ class RagResponse(BaseModel):
     chunks: List[RagChunk]
 
 
-# ---------- ZÁKLADNÍ ENDPOINTY ----------
+# ---------- HEALTH ----------
 
 @app.get("/health")
 def health():
@@ -155,6 +136,32 @@ def healthz():
     return {"status": "ok"}
 
 
+# ---------- DEBUG ENDPOINT (kontrola jednoho fragmentu) ----------
+
+@app.get("/debug-fragment/{fragment_id}")
+def debug_fragment(fragment_id: int):
+    sql = """
+        SELECT fragment_id, fragment_text
+        FROM esb_fragment_text
+        WHERE fragment_id = %s;
+    """
+    rows = run_query(sql, (fragment_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail="fragment nenalezen")
+
+    row = rows[0]
+    raw = row["fragment_text"] or ""
+
+    return {
+        "fragment_id": row["fragment_id"],
+        "raw": raw,
+        "stripped": strip_html(raw),
+        "safe": safe_out(strip_html(raw)),
+    }
+
+
+# ---------- FULLTEXT /search (pro text, ne embedding) ----------
+
 @app.get("/search", response_model=List[SearchResult])
 def search(
     query: str = Query(...),
@@ -164,6 +171,7 @@ def search(
     if not q:
         raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
 
+    # jednodušší hledání: substring přes text bez HTML
     sql = """
         SELECT
             m.fragment_id,
@@ -172,22 +180,18 @@ def search(
         FROM esb_fragment_meta m
         JOIN esb_fragment_text t
           ON t.fragment_id = m.fragment_id
-        WHERE to_tsvector(
-                  'simple',
-                  regexp_replace(
-                      COALESCE(t.fragment_text, ''),
-                      '<[^>]+>', ' ',
-                      'g'
-                  )
-              )
-              @@ plainto_tsquery('simple', %s)
-        ORDER BY m.fragment_id
+        WHERE regexp_replace(
+                  COALESCE(t.fragment_text, ''),
+                  '<[^>]+>', ' ',
+                  'g'
+              ) ILIKE '%' || %s || '%'
         LIMIT %s;
     """
 
     try:
         rows = run_query(sql, (q, limit))
-    except Exception:
+    except Exception as e:
+        print("DB error in /search:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
 
     results: List[SearchResult] = []
@@ -208,16 +212,8 @@ def search(
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
-    """
-    RAG endpoint:
-    - klient pošle syrový text smlouvy v body (text/plain)
-    - vytvoříme embedding dotazu
-    - v DB najdeme nejbližší fragmenty podle pgvector
-    """
-
     raw = await request.body()
 
-    # robustní dekódování
     try:
         contract_text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -253,7 +249,7 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         JOIN esb_fragment_embedding e
           ON e.fragment_id = m.fragment_id
         WHERE t.fragment_text IS NOT NULL
-          AND length(trim(t.fragment_text)) > 20
+          AND length(trim(t.fragment_text)) > 50   -- vyhoď úplně krátké hlavičky
         ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
@@ -278,3 +274,4 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
+
