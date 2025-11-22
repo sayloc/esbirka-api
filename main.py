@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import codecs
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -84,16 +85,31 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def decode_latin_mess(s: str) -> str:
+    """
+    Některé texty přijdou jako UTF-8 bajty uložené v Latin-1.
+    Tohle se je pokusí převést zpět na normální UTF-8.
+    'ÄÃST' -> 'ČÁST'
+    """
+    if not s:
+        return ""
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except Exception:
+        return s
+
+
 def clean_text_for_embedding(text: str) -> str:
     """
-    Vyčistí text před posláním do embeddingu:
+    Vyčistí text před embeddingem:
+    - opraví rozbité kódování
     - odstraní HTML tagy
-    - znormalizuje whitespace
-    - ořeže na rozumnou délku
+    - znormalizuje mezery
+    - ořízne na max 4000 znaků
     """
     if not text:
         return ""
-    text = html.unescape(text)
+    text = decode_latin_mess(text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = normalize_whitespace(text)
     return text[:4000]
@@ -102,15 +118,17 @@ def clean_text_for_embedding(text: str) -> str:
 def safe_out(text: str) -> str:
     """
     Výstup pro klienta:
+    - opraví rozbité kódování
     - dekóduje HTML entity (&aacute; -> á)
     - odstraní HTML tagy
     - znormalizuje mezery
     """
     if not text:
         return ""
-    s = html.unescape(text)
-    s = re.sub(r"<[^>]+>", " ", s)
-    return normalize_whitespace(s)
+    text = decode_latin_mess(text)
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return normalize_whitespace(text)
 
 
 def embed_query(text: str) -> List[float]:
@@ -194,7 +212,7 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
 
     raw = await request.body()
 
-    # robustní dekódování (bez 500 při špatném kódování)
+    # robustní dekódování requestu
     try:
         contract_text = raw.decode("utf-8")
     except UnicodeDecodeError:
