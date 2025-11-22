@@ -71,13 +71,13 @@ def clean_text_for_embedding(text: str) -> str:
 
 app = FastAPI(title="eSbírka Search API")
 
+# TADY BYLA CHYBA – musí se předat TŘÍDA, ne instance
 app.add_middleware(
-    CORSMiddleware(
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -113,7 +113,7 @@ def healthz():
 @app.get("/version")
 def version():
     # ať víme, že běží správná verze kódu
-    return {"version": "rag_v2_utf8ignore"}
+    return {"version": "rag_v2_utf8ignore_corsfix"}
 
 
 @app.get("/search", response_model=List[SearchResult])
@@ -178,7 +178,7 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
 
     raw = await request.body()
 
-    # DŮLEŽITÉ: tolerujeme nevalidní UTF-8 bajty
+    # tolerujeme nevalidní UTF-8 bajty
     raw_text = raw.decode("utf-8", errors="ignore")
     contract_text = clean_text_for_embedding(raw_text)
 
@@ -223,4 +223,3 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         chunks.append(RagChunk(citation=citation, text=text))
 
     return RagResponse(chunks=chunks)
-
