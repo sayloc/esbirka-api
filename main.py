@@ -47,31 +47,10 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             conn.close()
 
 
-# ---------- TEXT POMOCNÉ FUNKCE ----------
-
-HTML_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def strip_html(text: str) -> str:
-    if not text:
-        return ""
-    return HTML_TAG_RE.sub(" ", text)
-
-
-def normalize_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def clean_text_for_embedding(text: str) -> str:
-    # vyhodíme HTML, znormalizujeme mezery
-    return normalize_whitespace(strip_html(text))
-
-
 # ---------- FastAPI ----------
 
 app = FastAPI(title="eSbírka Search API")
 
-# TADY BYLA CHYBA – musí se předat TŘÍDA, ne instance
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -90,12 +69,40 @@ class SearchResult(BaseModel):
 
 
 class RagChunk(BaseModel):
+    fragment_id: int
     citation: str
     text: str
 
 
 class RagResponse(BaseModel):
     chunks: List[RagChunk]
+
+
+# ---------- UTIL FUNKCE ----------
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_text_for_embedding(raw: bytes) -> str:
+    """
+    Bezpečné dekódování request body -> text pro embedding.
+    """
+    try:
+        txt = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # když klient neposlal čisté UTF-8, nahradíme rozbité znaky
+        txt = raw.decode("utf-8", errors="replace")
+    return normalize_whitespace(txt)
+
+
+def embed_query(text: str) -> List[float]:
+    clipped = text[:4000] if text else ""
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=clipped,
+    )
+    return resp.data[0].embedding
 
 
 # ---------- ZÁKLADNÍ ENDPOINTY ----------
@@ -108,12 +115,6 @@ def health():
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
-
-
-@app.get("/version")
-def version():
-    # ať víme, že běží správná verze kódu
-    return {"version": "rag_v2_utf8ignore_corsfix"}
 
 
 @app.get("/search", response_model=List[SearchResult])
@@ -151,18 +152,17 @@ def search(
     except Exception:
         raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
 
-    return rows
-
-
-# ---------- EMBEDDING POMOCNÉ FUNKCE ----------
-
-def embed_query(text: str) -> List[float]:
-    clipped = text[:4000] if text else ""
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=clipped,
-    )
-    return resp.data[0].embedding
+    # lehké očištění textu
+    cleaned = []
+    for r in rows:
+        cleaned.append(
+            {
+                "fragment_id": r["fragment_id"],
+                "citace": r.get("citace"),
+                "text": normalize_whitespace(r.get("text") or ""),
+            }
+        )
+    return cleaned
 
 
 # ---------- RAG ENDPOINT (embedding RAG) ----------
@@ -170,29 +170,29 @@ def embed_query(text: str) -> List[float]:
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
-    RAG endpoint pro Make / test:
-    - klient pošle syrový text smlouvy v body (text/plain)
-    - text zčistíme, uděláme embedding
-    - v DB najdeme nejbližší fragmenty podle pgvector
+    RAG endpoint:
+    - klient pošle syrový text smlouvy / dokumentu v body (text/plain)
+    - vytvoříme embedding dotazu
+    - v DB najdeme nejbližší fragmenty podle pgvector (esb_fragment_embedding)
     """
 
     raw = await request.body()
-
-    # tolerujeme nevalidní UTF-8 bajty
-    raw_text = raw.decode("utf-8", errors="ignore")
-    contract_text = clean_text_for_embedding(raw_text)
+    contract_text = clean_text_for_embedding(raw)
 
     if not contract_text:
         return RagResponse(chunks=[])
 
+    # 1) embedding dotazu
     try:
         vec = embed_query(contract_text)
     except Exception as e:
         print("Embedding error:", repr(e))
         raise HTTPException(status_code=500, detail="Chyba při volání embedding modelu.")
 
+    # 2) připravíme vektor pro pgvector
     vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
+    # 3) vybereme nejbližší fragmenty
     sql = """
         SELECT
             m.fragment_id,
@@ -203,7 +203,8 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
           ON t.fragment_id = m.fragment_id
         JOIN esb_fragment_embedding e
           ON e.fragment_id = m.fragment_id
-        WHERE length(trim(t.fragment_text)) > 50
+        WHERE t.fragment_text IS NOT NULL
+          AND length(trim(t.fragment_text)) > 0
         ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
@@ -216,10 +217,18 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
 
     chunks: List[RagChunk] = []
     for r in rows:
+        fid = r["fragment_id"]
         citation = r.get("citace") or "bez citace"
-        text = clean_text_for_embedding(r.get("text") or "")
+        text = normalize_whitespace(r.get("text") or "")
         if not text:
             continue
-        chunks.append(RagChunk(citation=citation, text=text))
+
+        chunks.append(
+            RagChunk(
+                fragment_id=fid,
+                citation=citation,
+                text=text,
+            )
+        )
 
     return RagResponse(chunks=chunks)
