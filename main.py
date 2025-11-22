@@ -34,10 +34,18 @@ def get_conn():
 
 
 def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
+    """
+    Obecná helper funkce pro SELECTy.
+    Když něco spadne, vytiskneme SQL + params do logu.
+    """
     conn = None
     try:
         conn = get_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # DEBUG – klidně si pak zakomentuj
+            # print("SQL:", sql)
+            # print("PARAMS:", params)
+
             cur.execute(sql, params or ())
             rows = cur.fetchall()
         return rows
@@ -49,7 +57,7 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
             conn.close()
 
 
-# ---------- FastAPI + UTF-8 JSON ----------
+# ---------- FastAPI ----------
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
@@ -96,32 +104,29 @@ def normalize_whitespace(text: str) -> str:
 def strip_html(text: str) -> str:
     if not text:
         return ""
-    # pryč HTML tagy
+    # pryč <tagy>
     text = re.sub(r"<[^>]+>", " ", text)
     return normalize_whitespace(text)
 
 
-def safe_out(text: str) -> str:
-    """
-    Výstup pro klienta: dekóduje HTML entity (&aacute; -> á)
-    a ořízne mezery.
-    """
-    return html.unescape(text or "").strip()
-
-
 def clean_text_for_embedding(text: str) -> str:
     """
-    Čištění textu před embeddingem (dotaz i fragmenty):
+    Vyčistí text před embeddingem:
     - odstraní HTML tagy
-    - dekóduje HTML entity
     - znormalizuje whitespace
-    - zkrátí na 4000 znaků
+    - ořeže na ~4000 znaků
     """
-    if not text:
-        return ""
     text = strip_html(text)
-    text = safe_out(text)
     return text[:4000]
+
+
+def safe_out(text: str) -> str:
+    """
+    Výstup pro klienta:
+    - dekóduje HTML entity (&aacute; -> á)
+    - ořízne mezery
+    """
+    return html.unescape(text or "").strip()
 
 
 def embed_query(text: str) -> List[float]:
@@ -147,13 +152,17 @@ def healthz():
 
 @app.get("/echo-test")
 def echo_test():
+    # rychlý test UTF-8
     return {"message": "Příliš žluťoučký kůň úpěl ďábelské ódy."}
 
 
 @app.get("/debug-fragment/{fragment_id}")
 def debug_fragment(fragment_id: int):
+    """
+    Debug: načte syrový text fragmentu a ukáže raw/stripped/safe.
+    """
     sql = """
-        SELECT fragment_id, fragment_text
+        SELECT fragment_text
         FROM esb_fragment_text
         WHERE fragment_id = %s;
     """
@@ -173,8 +182,6 @@ def debug_fragment(fragment_id: int):
     }
 
 
-# ---------- FULLTEXT /search (zatím jednoduchý) ----------
-
 @app.get("/search", response_model=List[SearchResult])
 def search(
     query: str = Query(...),
@@ -184,7 +191,6 @@ def search(
     if not q:
         raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
 
-    # jednoduchý fulltext přes czech konfiguraci
     sql = """
         SELECT
             m.fragment_id,
@@ -194,14 +200,14 @@ def search(
         JOIN esb_fragment_text t
           ON t.fragment_id = m.fragment_id
         WHERE to_tsvector(
-                  'czech',
+                  'simple',
                   regexp_replace(
                       COALESCE(t.fragment_text, ''),
                       '<[^>]+>', ' ',
                       'g'
                   )
               )
-              @@ plainto_tsquery('czech', %s)
+              @@ plainto_tsquery('simple', %s)
         ORDER BY m.fragment_id
         LIMIT %s;
     """
@@ -217,26 +223,26 @@ def search(
             SearchResult(
                 fragment_id=r["fragment_id"],
                 citace=safe_out(r.get("citace")),
-                text=strip_html(r.get("text") or ""),
+                text=normalize_whitespace(safe_out(r.get("text"))),
             )
         )
     return results
 
 
-# ---------- RAG ENDPOINT (čistý vektor + paragrafy) ----------
+# ---------- RAG ENDPOINT (embedding RAG) ----------
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     """
-    RAG endpoint pro Make:
-    - Make pošle syrový text smlouvy / dotazu v body (text/plain)
-    - Vytvoříme embedding dotazu
-    - V DB najdeme nejbližší paragrafy pomocí pgvector
+    RAG endpoint:
+    - klient pošle syrový text smlouvy / dotazu v body (text/plain)
+    - vytvoříme embedding dotazu
+    - v DB najdeme nejbližší fragmenty (pgvector)
     """
 
     raw = await request.body()
 
-    # robustní dekódování
+    # robustní dekódování vstupu
     try:
         contract_text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -250,21 +256,22 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
     if not contract_text:
         return RagResponse(chunks=[])
 
+    # --- EMBEDDING DOTAZU ---
     try:
         vec = embed_query(contract_text)
     except Exception as e:
         print("Embedding error:", repr(e))
         raise HTTPException(
             status_code=500,
-            detail="Chyba při volání embedding modelu."
+            detail=f"Embedding error: {repr(e)}",
         )
 
     vec_str = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
-    # ČISTÝ VEKTOR + FILTR NA PARAGRAFY (§ ...)
+    # --- RAG DOTAZ DO DB ---
     sql = """
         SELECT
-            m.fragment_id,
+            e.fragment_id,
             m.citace_text AS citace,
             t.fragment_text AS text
         FROM esb_fragment_embedding e
@@ -285,7 +292,7 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         print("RAG DB error:", repr(e))
         raise HTTPException(
             status_code=500,
-            detail="Chyba při RAG dotazu do databáze."
+            detail=f"RAG DB error: {repr(e)}",
         )
 
     chunks: List[RagChunk] = []
@@ -306,3 +313,4 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         )
 
     return RagResponse(chunks=chunks)
+
