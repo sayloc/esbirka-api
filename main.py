@@ -50,6 +50,7 @@ def run_query(sql: str, params: Optional[tuple] = None) -> List[dict]:
 
 # ---------- POMOCNÉ FUNKCE ----------
 
+
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -57,32 +58,30 @@ def normalize_whitespace(text: str) -> str:
 def strip_html(text: str) -> str:
     if not text:
         return ""
-    return re.sub(r"<[^>]+>", " ", text)
+    # pryč tagy typu <var>, <sup>, <table> atd.
+    text = re.sub(r"<[^>]+>", " ", text)
+    return normalize_whitespace(text)
 
 
 def clean_text_for_embedding(text: str) -> str:
+    """
+    Vyčistí text před embeddingem:
+    - odstraní HTML tagy
+    - znormalizuje mezery
+    - ořeže na rozumnou délku
+    """
     if not text:
         return ""
     text = strip_html(text)
-    text = normalize_whitespace(text)
     return text[:4000]
 
 
-def fix_mojibake(text: str) -> str:
-    if not text:
-        return ""
-    if "Ã" in text or "Ä" in text:
-        try:
-            return text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-        except Exception:
-            return text
-    return text
-
-
 def safe_out(text: str) -> str:
-    t = html.unescape(text or "")
-    t = fix_mojibake(t)
-    return t.strip()
+    """
+    Výstup pro klienta: dekóduje HTML entity (&aacute; -> á)
+    a ořízne mezery.
+    """
+    return html.unescape(text or "").strip()
 
 
 def embed_query(text: str) -> List[float]:
@@ -109,6 +108,7 @@ app.add_middleware(
 
 # ---------- MODELY ----------
 
+
 class SearchResult(BaseModel):
     fragment_id: int
     citace: Optional[str]
@@ -116,6 +116,7 @@ class SearchResult(BaseModel):
 
 
 class RagChunk(BaseModel):
+    fragment_id: int
     citation: str
     text: str
 
@@ -124,7 +125,8 @@ class RagResponse(BaseModel):
     chunks: List[RagChunk]
 
 
-# ---------- HEALTH ----------
+# ---------- ZÁKLADNÍ ENDPOINTY ----------
+
 
 @app.get("/health")
 def health():
@@ -136,7 +138,57 @@ def healthz():
     return {"status": "ok"}
 
 
-# ---------- DEBUG ENDPOINT (kontrola jednoho fragmentu) ----------
+@app.get("/search", response_model=List[SearchResult])
+def search(
+    query: str = Query(...),
+    limit: int = Query(5, ge=1, le=50),
+):
+    q = query.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
+
+    sql = """
+        SELECT
+            m.fragment_id,
+            m.citace_text AS citace,
+            t.fragment_text AS text
+        FROM esb_fragment_meta m
+        JOIN esb_fragment_text t
+          ON t.fragment_id = m.fragment_id
+        WHERE to_tsvector(
+                  'simple',
+                  regexp_replace(
+                      COALESCE(t.fragment_text, ''),
+                      '<[^>]+>', ' ',
+                      'g'
+                  )
+              )
+              @@ plainto_tsquery('simple', %s)
+        ORDER BY m.fragment_id
+        LIMIT %s;
+    """
+
+    try:
+        rows = run_query(sql, (q, limit))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
+
+    results: List[SearchResult] = []
+    for r in rows:
+        results.append(
+            SearchResult(
+                fragment_id=r["fragment_id"],
+                citace=safe_out(r.get("citace")),
+                text=normalize_whitespace(
+                    safe_out(strip_html(r.get("text") or ""))
+                ),
+            )
+        )
+    return results
+
+
+# ---------- DEBUG ENDPOINT PRO JEDEN FRAGMENT ----------
+
 
 @app.get("/debug-fragment/{fragment_id}")
 def debug_fragment(fragment_id: int):
@@ -160,60 +212,21 @@ def debug_fragment(fragment_id: int):
     }
 
 
-# ---------- FULLTEXT /search (pro text, ne embedding) ----------
-
-@app.get("/search", response_model=List[SearchResult])
-def search(
-    query: str = Query(...),
-    limit: int = Query(5, ge=1, le=50),
-):
-    q = query.strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="query nesmí být prázdné.")
-
-    # jednodušší hledání: substring přes text bez HTML
-    sql = """
-        SELECT
-            m.fragment_id,
-            m.citace_text AS citace,
-            t.fragment_text AS text
-        FROM esb_fragment_meta m
-        JOIN esb_fragment_text t
-          ON t.fragment_id = m.fragment_id
-        WHERE regexp_replace(
-                  COALESCE(t.fragment_text, ''),
-                  '<[^>]+>', ' ',
-                  'g'
-              ) ILIKE '%' || %s || '%'
-        LIMIT %s;
-    """
-
-    try:
-        rows = run_query(sql, (q, limit))
-    except Exception as e:
-        print("DB error in /search:", repr(e))
-        raise HTTPException(status_code=500, detail="Chyba při dotazu do databáze.")
-
-    results: List[SearchResult] = []
-    for r in rows:
-        results.append(
-            SearchResult(
-                fragment_id=r["fragment_id"],
-                citace=safe_out(r.get("citace")),
-                text=normalize_whitespace(
-                    safe_out(strip_html(r.get("text") or ""))
-                ),
-            )
-        )
-    return results
-
-
 # ---------- RAG ENDPOINT (embedding RAG) ----------
+
 
 @app.post("/rag-search", response_model=RagResponse)
 async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
+    """
+    RAG endpoint pro Make:
+    - Make pošle syrový text smlouvy v body (text/plain)
+    - Vytvoříme embedding dotazu
+    - V DB najdeme nejbližší fragmenty podle pgvector
+    """
+
     raw = await request.body()
 
+    # robustní dekódování (bez 500 při špatném kódování)
     try:
         contract_text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -249,7 +262,7 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
         JOIN esb_fragment_embedding e
           ON e.fragment_id = m.fragment_id
         WHERE t.fragment_text IS NOT NULL
-          AND length(trim(t.fragment_text)) > 50   -- vyhoď úplně krátké hlavičky
+          AND length(trim(t.fragment_text)) > 20
         ORDER BY e.embedding <-> %s::vector
         LIMIT %s;
     """
@@ -265,13 +278,19 @@ async def rag_search(request: Request, top_k: int = Query(5, ge=1, le=20)):
 
     chunks: List[RagChunk] = []
     for r in rows:
+        fid = r["fragment_id"]
         citation = safe_out(r.get("citace") or "bez citace")
         text = normalize_whitespace(
             safe_out(strip_html(r.get("text") or ""))
         )
         if not text:
             continue
-        chunks.append(RagChunk(citation=citation, text=text))
+        chunks.append(
+            RagChunk(
+                fragment_id=fid,
+                citation=citation,
+                text=text,
+            )
+        )
 
     return RagResponse(chunks=chunks)
-
